@@ -85,44 +85,108 @@
 *********/
 
 
+/*********
+  Solar Diagnostic Tool — unified sensor firmware
+  Reads voltage, current, and temperature together each loop.
+*********/
+
 #include <Arduino.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
-const int analogPin = 34; // ESP32 pin connected to the sensor's S pin
+// ---------- Pin assignments ----------
+const int PIN_VOLTAGE = 34; // Voltage divider module S pin (ADC1)
+const int PIN_CURRENT = 35; // ACS712 OUT pin (ADC1)
+const int PIN_ONEWIRE = 4;  // DS18B20 data line (4.7k pull-up to 3.3V)
 
-// The resistor divider scale factor. 
-// Standard 0-25V modules step voltage down by 5.
-const float VCC_DividerRatio = 5.0; 
+// ---------- ADC constants ----------
+const float ADC_VREF       = 3.3;   // ESP32 reference voltage
+const int   ADC_RESOLUTION = 4095;  // 12-bit ADC
+const int   ADC_SAMPLES    = 16;    // oversampling count for noise reduction
 
-// The ESP32 ADC reference voltage is 3.3V, but 11dB attenuation 
-// allows a measurement range up to about 3.6V.
-const float ADC_VREF = 3.3; 
-const int ADC_Resolution = 4095; // 12-bit ADC
+// ---------- Voltage divider ----------
+// Standard 0-25V module steps the input voltage down by 5.
+const float VCC_DIVIDER_RATIO = 5.0;
+
+// ---------- ACS712 current sensor ----------
+// 30A module: 66 mV per amp. Zero-current output is calibrated at boot.
+const float ACS712_SENSITIVITY = 0.066; // V per A (30A variant)
+float g_iZeroVoltage = 2.5;              // refined by calibrateCurrentZero()
+
+// ---------- DS18B20 ----------
+OneWire oneWire(PIN_ONEWIRE);
+DallasTemperature sensors(&oneWire);
+
+// Average several ADC samples and return the pin voltage (0 - ADC_VREF).
+float readPinVoltage(int pin) {
+  long sum = 0;
+  for (int i = 0; i < ADC_SAMPLES; i++) {
+    sum += analogRead(pin);
+  }
+  float avgCounts = (float)sum / ADC_SAMPLES;
+  return (avgCounts / ADC_RESOLUTION) * ADC_VREF;
+}
+
+// Measure the ACS712 quiescent output with no current flowing.
+void calibrateCurrentZero() {
+  long sum = 0;
+  for (int i = 0; i < 200; i++) {
+    sum += analogRead(PIN_CURRENT);
+    delay(1);
+  }
+  g_iZeroVoltage = ((float)sum / 200.0 / ADC_RESOLUTION) * ADC_VREF;
+  Serial.print("ACS712 zero offset calibrated: ");
+  Serial.print(g_iZeroVoltage, 4);
+  Serial.println(" V");
+}
 
 void setup() {
   Serial.begin(115200);
-  
-  // Set the ADC attenuation to 11dB (allows reading up to ~3.3V - 3.6V)
+
+  // 11dB attenuation gives a measurement range up to ~3.3V (full scale).
   analogSetAttenuation(ADC_11db);
+
+  Serial.println("Calibrating ACS712 — ensure no current is flowing...");
+  calibrateCurrentZero();
+
+  // Start the DS18B20 and queue the first conversion asynchronously so the
+  // loop never blocks on the ~750ms conversion time.
+  sensors.begin();
+  sensors.setWaitForConversion(false);
+  sensors.requestTemperatures();
+
+  Serial.println("Solar diagnostic sensors ready.");
 }
 
 void loop() {
-  // Read the analog value (0 - 4095)
-  int analogValue = analogRead(analogPin);
-  
-  // Convert the analog reading to actual voltage at the ESP32 pin
-  float pinVoltage = (analogValue / (float)ADC_Resolution) * ADC_VREF;
-  
-  // Calculate original input voltage using the divider ratio
-  float inputVoltage = pinVoltage * VCC_DividerRatio;
-  
-  // Print results to the Serial Monitor
-  Serial.print("Analog Value: ");
-  Serial.print(analogValue);
-  Serial.print("\t Pin Voltage: ");
-  Serial.print(pinVoltage, 2);
-  Serial.print("V \t Calculated Input Voltage: ");
-  Serial.print(inputVoltage, 2);
-  Serial.println("V");
+  // ----- Voltage -----
+  float vPin = readPinVoltage(PIN_VOLTAGE);
+  float inputVoltage = vPin * VCC_DIVIDER_RATIO;
 
-  delay(1000); // Wait 1 second before next reading
+  // ----- Current -----
+  float iPin = readPinVoltage(PIN_CURRENT);
+  float current = (iPin - g_iZeroVoltage) / ACS712_SENSITIVITY;
+  if (current < 0) current = 0; // clamp DC-only readings
+
+  // ----- Temperature (result of the conversion queued last tick) -----
+  float temperatureC = sensors.getTempCByIndex(0);
+
+  // ----- Report -----
+  Serial.print("Voltage: ");
+  Serial.print(inputVoltage, 2);
+  Serial.print(" V\tCurrent: ");
+  Serial.print(current, 3);
+  Serial.print(" A\tTemp: ");
+  if (temperatureC == DEVICE_DISCONNECTED_C) {
+    Serial.print("n/a");
+  } else {
+    Serial.print(temperatureC, 1);
+    Serial.print(" C");
+  }
+  Serial.println();
+
+  // Queue the next temperature conversion; it will be ready by the next tick.
+  sensors.requestTemperatures();
+
+  delay(1000); // 1s reporting interval
 }
