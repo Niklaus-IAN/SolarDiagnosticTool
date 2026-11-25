@@ -91,6 +91,7 @@
 *********/
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <BLEDevice.h>
@@ -105,9 +106,18 @@ const int PIN_CURRENT   = 35; // ACS712 OUT via ÷2 divider    (ADC1_CH7)
 const int PIN_ONEWIRE   = 4;  // DS18B20 bus (4.7k pull-up to 3.3V)
 
 // ---------- ADC constants ----------
-const float ADC_VREF       = 3.3;   // ESP32 reference voltage
-const int   ADC_RESOLUTION = 4095;  // 12-bit ADC
-const int   ADC_SAMPLES    = 16;    // oversampling count for noise reduction
+// Conversion goes through analogReadMilliVolts(), which applies the per-chip
+// eFuse calibration. The raw (counts/4095)*3.3 formula assumes a straight line
+// the ESP32 ADC does not follow at 11dB — on the bench it read ~0.14V low
+// around 0.8V, a 17% error no divider-ratio calibration can correct.
+const int ADC_SAMPLES = 16;         // oversampling count for the voltage channels
+
+// The PWM controller chops the panel line on and off at a few hundred Hz, so
+// the current in that wire is a square wave, not DC. 16 back-to-back samples
+// finish well inside one switching cycle, which makes each reading a random
+// phase snapshot rather than an average. Sample the current channel across a
+// fixed window instead, long enough to cover many cycles.
+const uint32_t CURRENT_WINDOW_MS = 32;
 
 // ---------- Voltage dividers (Phase 1.1 / Phase 2) ----------
 // Panel channel has an added ~22k series resistor so a 22V panel stays under
@@ -123,7 +133,23 @@ float BATTERY_DIVIDER_RATIO = 5.0;  // CALIBRATE on bench
 // sensor domain (captures ~2.5V idle automatically).
 const float ACS712_SENSITIVITY = 0.066; // V per A (30A variant)
 const float ACS712_OUT_DIVIDER = 2.0;   // external ÷2 on OUT
-float g_iZeroVoltage = 2.5;             // refined by calibrateCurrentZero()
+
+// One ADC count is ~24mA through this chain and the channel carries roughly
+// ±0.07A of inherent noise. Readings inside the deadband report as exactly
+// zero; outside it the sign is preserved, so reverse flow and night-time drain
+// stay visible instead of being clamped away.
+const float CURRENT_DEADBAND_A = 0.10;
+
+// The zero is measured once under known-quiet conditions and kept in NVS. It is
+// deliberately NOT re-measured at boot: the tool is powered from the system
+// battery, so it can only ever start up on a live system, and in daylight
+// current is already flowing through the sensor by then. A boot-time
+// measurement would record a loaded reading as "zero" on every single start.
+Preferences g_prefs;
+const char *PREF_NAMESPACE = "solardiag";
+const char *PREF_KEY_IZERO = "izero";
+float g_iZeroVoltage = 2.5;   // sensor domain; loaded from NVS in setup()
+bool  g_iZeroStored  = false; // false => never calibrated, readings provisional
 
 // ---------- DS18B20 (Phase 3) ----------
 // Two probes share the bus: index 0 = panel, index 1 = ambient.
@@ -132,33 +158,61 @@ float g_iZeroVoltage = 2.5;             // refined by calibrateCurrentZero()
 OneWire oneWire(PIN_ONEWIRE);
 DallasTemperature sensors(&oneWire);
 
-// Average several ADC samples and return the pin voltage (0 - ADC_VREF).
+// Average several calibrated ADC samples and return the pin voltage in volts.
 float readPinVoltage(int pin) {
-  long sum = 0;
+  uint32_t sum = 0;
   for (int i = 0; i < ADC_SAMPLES; i++) {
-    sum += analogRead(pin);
+    sum += analogReadMilliVolts(pin);
   }
-  float avgCounts = (float)sum / ADC_SAMPLES;
-  return (avgCounts / ADC_RESOLUTION) * ADC_VREF;
+  return (sum / (float)ADC_SAMPLES) / 1000.0f;
+}
+
+// Average the ACS712 pin across CURRENT_WINDOW_MS so the PWM chopping in the
+// panel line averages out instead of aliasing.
+float readCurrentPinVoltage() {
+  uint32_t sum = 0, n = 0;
+  uint32_t start = millis();
+  while ((millis() - start) < CURRENT_WINDOW_MS) {
+    sum += analogReadMilliVolts(PIN_CURRENT);
+    n++;
+  }
+  if (n == 0) n = 1;
+  return (sum / (float)n) / 1000.0f;
 }
 
 // Read the ACS712 output referred back through the external ÷2 divider.
 float readCurrentSensorVoltage() {
-  return readPinVoltage(PIN_CURRENT) * ACS712_OUT_DIVIDER;
+  return readCurrentPinVoltage() * ACS712_OUT_DIVIDER;
 }
 
-// Measure the ACS712 quiescent output with no current flowing.
+// Measure and store the ACS712 quiescent output. The caller must guarantee no
+// current is flowing — cover the panel, or open the panel line.
 void calibrateCurrentZero() {
-  long sum = 0;
+  uint32_t sum = 0;
   for (int i = 0; i < 200; i++) {
-    sum += analogRead(PIN_CURRENT);
+    sum += analogReadMilliVolts(PIN_CURRENT);
     delay(1);
   }
-  float avgPinV = ((float)sum / 200.0 / ADC_RESOLUTION) * ADC_VREF;
+  float avgPinV = (sum / 200.0f) / 1000.0f;
   g_iZeroVoltage = avgPinV * ACS712_OUT_DIVIDER;
-  Serial.print("ACS712 zero offset calibrated: ");
+  g_iZeroStored  = true;
+  g_prefs.putFloat(PREF_KEY_IZERO, g_iZeroVoltage);
+
+  Serial.print("ACS712 zero stored: ");
   Serial.print(g_iZeroVoltage, 4);
-  Serial.println(" V (sensor domain)");
+  Serial.print(" V (sensor domain), raw pin ");
+  Serial.print(avgPinV, 4);
+  Serial.println(" V");
+
+  // The raw pin voltage reveals whether the external ÷2 is actually fitted:
+  // a bare ACS712 idles near 2.5V, halved it lands near 1.25V. Without the
+  // divider every current reading is double the truth and the pin exceeds
+  // 3.3V above ~13A.
+  if (avgPinV > 1.9f) {
+    Serial.println("  WARNING: raw pin near 2.5V — the ÷2 divider on ACS712 OUT looks MISSING");
+  } else {
+    Serial.println("  ÷2 divider on ACS712 OUT looks present");
+  }
 }
 
 // ---------- BLE · Nordic UART Service (Phase 5) ----------
@@ -169,8 +223,11 @@ void calibrateCurrentZero() {
 #define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // ESP32 -> phone (notify)
 
 BLECharacteristic *g_txChar = nullptr;
-bool g_bleConnected = false;
-bool g_advPending   = false; // re-advertise after a disconnect
+// Written from the BLE stack's task and read from loop(), so they must not be
+// cached in a register across the loop body.
+volatile bool g_bleConnected = false;
+volatile bool g_advPending   = false; // re-advertise after a disconnect
+volatile bool g_calRequested = false; // raised by BLE or serial, serviced in loop()
 
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *s) override {
@@ -184,19 +241,27 @@ class ServerCallbacks : public BLEServerCallbacks {
   }
 };
 
-// Short text commands from the app land here.
+// Short text commands from the app land here. This runs on the BLE stack's
+// task, so it only raises a flag — calibrateCurrentZero() blocks for 200ms of
+// delay() plus serial writes, which has no business inside a GATT callback.
 class RxCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
     std::string v = c->getValue();
     if (v.rfind("CAL", 0) == 0) { // starts with "CAL"
-      Serial.println("BLE command: recalibrate current zero");
-      calibrateCurrentZero();
+      g_calRequested = true;
     }
   }
 };
 
 void initBLE() {
   BLEDevice::init("SolarDiag"); // name shown when the app scans
+
+  // Without this the peer MTU stays at the 23-byte default, leaving 20 usable
+  // bytes per notification for a ~90-byte packet: notify() logs the truncation
+  // and sends anyway, so the app receives malformed JSON and drops it silently.
+  // The negotiated value is min(client, server), so the app requesting 247 on
+  // its own is not enough.
+  BLEDevice::setMTU(517);
 
   BLEServer *server = BLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
@@ -248,8 +313,20 @@ void setup() {
   // 11dB attenuation gives a measurement range up to ~3.3V (full scale).
   analogSetAttenuation(ADC_11db);
 
-  Serial.println("Calibrating ACS712 — ensure no current is flowing...");
-  calibrateCurrentZero();
+  // Restore the stored ACS712 zero rather than measuring one now — see the note
+  // by PREF_KEY_IZERO for why a boot-time measurement cannot be trusted here.
+  g_prefs.begin(PREF_NAMESPACE, false);
+  float stored = g_prefs.getFloat(PREF_KEY_IZERO, 0.0f);
+  if (stored > 0.1f) {
+    g_iZeroVoltage = stored;
+    g_iZeroStored  = true;
+    Serial.print("ACS712 zero restored from flash: ");
+    Serial.print(g_iZeroVoltage, 4);
+    Serial.println(" V (sensor domain)");
+  } else {
+    Serial.println("ACS712 has never been zeroed — current readings are PROVISIONAL.");
+    Serial.println("  Stop all current (cover the panel), then send CAL over serial or BLE.");
+  }
 
   // Start the DS18B20 bus and queue the first conversion asynchronously so the
   // loop never blocks on the ~750ms conversion time.
@@ -257,12 +334,30 @@ void setup() {
   sensors.setWaitForConversion(false);
   sensors.requestTemperatures();
 
+  uint8_t nProbes = sensors.getDeviceCount();
   Serial.print("DS18B20 probes found: ");
-  Serial.println(sensors.getDeviceCount());
+  Serial.println(nProbes);
+
+  // Print each probe's ROM address beside the index it gets read at, so the
+  // panel/ambient pair can be hard-coded once a pinch test says which is which.
+  for (uint8_t i = 0; i < nProbes; i++) {
+    DeviceAddress addr;
+    if (!sensors.getAddress(addr, i)) continue;
+    Serial.print("  index ");
+    Serial.print(i);
+    Serial.print(" -> ");
+    for (uint8_t b = 0; b < 8; b++) {
+      if (addr[b] < 16) Serial.print('0');
+      Serial.print(addr[b], HEX);
+    }
+    if (i == 0)      Serial.print("   (currently read as PANEL)");
+    else if (i == 1) Serial.print("   (currently read as AMBIENT)");
+    Serial.println();
+  }
 
   initBLE();
 
-  Serial.println("Solar diagnostic sensors ready.");
+  Serial.println("Solar diagnostic sensors ready.  Commands: CAL");
 }
 
 // Print a temperature or "n/a" if that probe is missing.
@@ -274,14 +369,44 @@ void printTemp(float c) {
   }
 }
 
+// Non-blocking serial command reader; recognises "CAL".
+void pollSerialCommand() {
+  static char buf[16];
+  static uint8_t len = 0;
+  while (Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch == '\n' || ch == '\r') {
+      for (uint8_t i = 0; i < len; i++) buf[i] = toupper(buf[i]);
+      buf[len] = '\0';
+      if (len && strcmp(buf, "CAL") == 0) g_calRequested = true;
+      len = 0;
+    } else if (len < sizeof(buf) - 1) {
+      buf[len++] = ch;
+    }
+  }
+}
+
 void loop() {
+  pollSerialCommand();
+
+  // Service a CAL raised by either the serial reader or the BLE task.
+  if (g_calRequested) {
+    g_calRequested = false;
+    Serial.println("Recalibrating ACS712 zero — no current must be flowing...");
+    calibrateCurrentZero();
+  }
+
   // ----- Voltages -----
   float panelV   = readPinVoltage(PIN_V_PANEL)   * PANEL_DIVIDER_RATIO;
   float batteryV = readPinVoltage(PIN_V_BATTERY) * BATTERY_DIVIDER_RATIO;
 
-  // ----- Current (through the ÷2 divider) -----
-  float current = (readCurrentSensorVoltage() - g_iZeroVoltage) / ACS712_SENSITIVITY;
-  if (current < 0) current = 0; // clamp: DC flows one direction here
+  // ----- Current (averaged over the PWM cycle, through the ÷2 divider) -----
+  float iPinV   = readCurrentPinVoltage();
+  float current = (iPinV * ACS712_OUT_DIVIDER - g_iZeroVoltage) / ACS712_SENSITIVITY;
+  // The sign is kept. A negative reading is real information — reverse flow,
+  // night-time drain, or a sensor wired backwards — and the old clamp to zero
+  // hid all three behind a plausible-looking 0.000.
+  if (fabsf(current) < CURRENT_DEADBAND_A) current = 0.0f;
 
   // ----- Power -----
   float power = panelV * current;

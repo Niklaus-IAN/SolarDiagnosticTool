@@ -17,8 +17,8 @@ JSON and feeds it into the fault-code engine (which lives on the app side).
 | Service (NUS) | `6e400001-b5a3-f393-e0a9-e50e24dcca9e` |
 | TX characteristic (device → app, **notify**) | `6e400003-b5a3-f393-e0a9-e50e24dcca9e` |
 | RX characteristic (app → device, **write**) | `6e400002-b5a3-f393-e0a9-e50e24dcca9e` |
-| Packet rate | 1 per second |
-| MTU | app **must** request ≥ 185 (packet ~90 bytes) |
+| Packet rate | ~1.05 s (1 s delay + sample time) — allow 3 s before flagging stale |
+| MTU | app **must** request ≥ 185; firmware ceiling is 517 (packet ~97 bytes) |
 
 ### Packet format
 ```json
@@ -29,7 +29,7 @@ JSON and feeds it into the fault-code engine (which lives on the app side).
 |---|---|---|
 | `v_panel` | V | panel voltage |
 | `v_batt` | V | battery voltage |
-| `current` | A | may read 0 (DC one-way clamp) |
+| `current` | A | **signed** — negative means reverse flow. `abs(I) < 0.1 A` sends exactly `0` (deadband) |
 | `power` | W | panel V × current |
 | `t_panel` | °C | JSON `null` if probe missing — **never 0** |
 | `t_amb` | °C | JSON `null` if probe missing — **never 0** |
@@ -45,6 +45,27 @@ Write the text `CAL` to the RX characteristic (`6e400002-…`) to re-zero the AC
 without a reboot. The RX characteristic **is exposed** in the firmware
 (`PROPERTY_WRITE`) and handled server-side — the app side just needs to write to it.
 
+> **Only send `CAL` with the ACS712 connected and no current flowing.** It samples the
+> pin and writes the result to NVS permanently. Sent with the sensor unplugged, it
+> stores a floating-pin value and destroys a good calibration. The firmware ignores any
+> text not starting with `CAL`, so write anything else to test the path safely.
+
+### Gotchas that have actually bitten us
+
+- **MTU is client-initiated.** The server can only raise its own ceiling; it cannot
+  force a bigger MTU. If the app never calls `requestMtu`, every packet truncates to
+  20 bytes and `jsonDecode` throws on every frame — which the `catch` block swallows
+  silently, so the symptom is an app that connects and then shows nothing at all.
+- **One client at a time.** If nRF Connect is still connected, the app cannot connect.
+- **`ts` resets to 0 on reboot.** A backwards jump means the device restarted, not that
+  the data is corrupt. (It also wraps at ~49.7 days of uptime.)
+- **Notifications are unacknowledged.** A dropped packet is gone; the next arrives ~1 s
+  later. Never assume an unbroken sequence.
+- **Current reads 0 at night by design.** The ACS712 is in the panel→controller line, so
+  it measures PV current only — never load draw or battery discharge. Fault codes that
+  need charge/discharge current cannot be computed with the sensor in this position.
+- **Android caches device names.** Scan by service UUID, not by name.
+
 ---
 
 ## 1. Packages
@@ -58,6 +79,10 @@ dependencies:
 ```bash
 flutter pub get
 ```
+
+> These pins date from 2024 and the caret locks `flutter_blue_plus` to 1.x. Check for a
+> current release before starting — the API in §6 (`platformName`, `onValueReceived`,
+> `requestMtu`) changed across major versions, so a newer package may need small edits.
 
 ## 2. Android permissions
 
@@ -222,7 +247,7 @@ onPressed: () => ble.recalibrate(),
 - [ ] Connect finds `SolarDiag` and connects (ESP32 powered + advertising)
 - [ ] Readings arrive ~1/sec; `t_panel` ~28 confirms a live probe
 - [ ] Repower the ESP32 → app handles the drop (add reconnect later)
-- [ ] `recalibrate()` → serial prints "recalibrate current zero"
+- [ ] `recalibrate()` → serial prints "Recalibrating ACS712 zero" (**only with the ACS712 connected and no current flowing** — see the CAL warning above)
 - [ ] Inject a high-voltage `Reading` → fault engine still fires
 
 ---
@@ -238,5 +263,10 @@ onPressed: () => ble.recalibrate(),
 - **The fault engine lives on the app**, not the firmware. The firmware only sends the
   six raw readings; the app computes fault codes, severities, corrective actions, and the
   health score, using per-site panel ratings (Voc, Vmpp, Isc, rated power) as thresholds.
-- Verified working end-to-end with **nRF Connect** (full packet received, notifications
-  enabled) on the bare ESP32 before app integration.
+- **Verification status (2026-09-24).** Confirmed with nRF Connect: service, TX/RX
+  characteristics, CCCD and notifications all correct, packets arriving. **Not yet
+  confirmed:** a full untruncated packet. The observed TX value was
+  `{"v_panel":3.09,"v_b` — exactly 20 bytes, i.e. MTU 23 minus the 3-byte ATT header.
+  `setMTU(517)` is now in the firmware, but nRF Connect does not request a larger MTU
+  on its own (⋮ → Request MTU). A Flutter client calling `requestMtu(247)` supplies
+  the missing half. Tick this off once a packet ending in `}` has actually been seen.
